@@ -1,6 +1,6 @@
 """YouTube Liked Downloader - Streamlit 主程序
-本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载（exe优先 + 库单流/合并）
-云端模式：仅导入浏览 + 视频下载（库单流/合并）
+本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载（exe优先 + 库单流/合并，带调试信息）
+云端模式：仅导入浏览 + 视频下载（库单流/合并，带调试信息）
 """
 import sys, os, json, zipfile, base64, tempfile, shutil, time, re, sqlite3, yt_dlp
 from pathlib import Path
@@ -61,17 +61,9 @@ if IS_PORTABLE:
 from core.drive_helper import get_drive_file_list, download_file_from_drive
 from core.packager import pack_clips_into_zip
 
-# ===== 核心下载函数（exe优先 + 库单流/合并）=====
+# ===== 核心下载函数（带调试信息）=====
 def download_720p_video(url: str, clip_name: str) -> bytes:
-    """下载视频，本地exe优先，云端使用yt-dlp库（先单流，后合并）"""
-    last_error = ""
-    log_messages = []
-
-    def log(msg):
-        log_messages.append(msg)
-        # 可选：print 到流日志
-        print(f"[download_720p] {msg}")
-
+    """下载视频，本地exe优先，云端使用yt-dlp库（带调试信息）"""
     # 1. 本地 exe 模式（优先）
     if IS_PORTABLE and BIN_DIR:
         import subprocess as sp
@@ -93,105 +85,91 @@ def download_720p_video(url: str, clip_name: str) -> bytes:
                             if f.stat().st_size > 0:
                                 return f.read_bytes()
                     except Exception as e:
-                        log(f"exe {fmt} 失败: {str(e)[:80]}")
                         continue
-            last_error = "exe 三方案均无有效文件"
-        else:
-            last_error = "yt-dlp_2.exe 不存在"
-    else:
-        last_error = "非便携模式"
 
-    # 2. yt-dlp 库模式
-    format_list = [
-        'best[height<=720][acodec!=none][vcodec!=none]',
-        'best[height<=480][acodec!=none][vcodec!=none]',
-        'best[acodec!=none][vcodec!=none]',
-        'worst[acodec!=none][vcodec!=none]',
-        'worst',
-    ]
-    client_variants = [
-        {'player_client': 'web', 'skip_webpage': False},
-        {'player_client': 'android', 'skip_webpage': True},
-        {'player_client': 'ios', 'skip_webpage': True},
-        {'player_client': 'tv', 'skip_webpage': True},
-    ]
-    base_opts = {
-        'quiet': True, 'no_warnings': True,
-        'socket_timeout': 30, 'retries': 3, 'fragment_retries': 3,
-        'ignoreerrors': True, 'geo_bypass': True,
-        'allow_unplayable_formats': True,
-        'postprocessors': [],
-        'merge_output_format': None,
-        'extractor_retries': 3,
-    }
+    # 2. yt-dlp 库模式（带调试信息）
+    st.info(f"开始用yt-dlp库下载: {url[:80]}...")
 
-    # 尝试单流
-    for client_cfg in client_variants:
-        for fmt in format_list:
-            log(f"尝试单流: cl={client_cfg.get('player_client')}, fmt={fmt}")
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix='.mp4')
-            os.close(tmp_fd)
-            try:
-                ydl_opts = {
-                    **base_opts,
-                    'format': fmt,
-                    'outtmpl': tmp_path,
-                    'extractor_args': {'youtube': [f"{k}={v}" for k, v in client_cfg.items()]},
-                }
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-                size = os.path.getsize(tmp_path)
-                if size > 0:
-                    with open(tmp_path, 'rb') as f:
-                        return f.read()
-                else:
-                    log(f"空文件, size=0")
-                    continue
-            except Exception as e:
-                log(f"异常: {str(e)[:100]}")
-                continue
-            finally:
-                try: os.unlink(tmp_path)
-                except: pass
+    # 测试信息提取
+    try:
+        tmp = yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True})
+        info = tmp.extract_info(url, download=False)
+        if info is None:
+            st.error("yt-dlp 无法获取视频信息 (返回 None)，可能网络被屏蔽")
+            raise RuntimeError("extract_info failed")
+        st.info(f"视频标题: {info.get('title', 'N/A')}")
+        formats = info.get('formats', [])
+        st.info(f"可用格式数: {len(formats)}")
+    except Exception as e:
+        st.error(f"信息提取失败: {e}")
+        raise RuntimeError(f"yt-dlp extract failed: {e}")
 
-    # 尝试合并流（需要ffmpeg）
-    log("单流均失败，尝试合并流...")
-    merge_formats = [
-        'bestvideo[height<=720]+bestaudio/best[height<=720]',
-        'bestvideo[height<=480]+bestaudio/best[height<=480]',
-        'bestvideo+bestaudio/best',
-    ]
-    for client_cfg in client_variants:
-        for fmt in merge_formats:
-            log(f"尝试合并: cl={client_cfg.get('player_client')}, fmt={fmt}")
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix='.mp4')
-            os.close(tmp_fd)
-            try:
-                ydl_opts = {
-                    **base_opts,
-                    'format': fmt,
-                    'outtmpl': tmp_path,
-                    'merge_output_format': 'mp4',
-                    'extractor_args': {'youtube': [f"{k}={v}" for k, v in client_cfg.items()]},
-                }
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-                size = os.path.getsize(tmp_path)
-                if size > 0:
-                    with open(tmp_path, 'rb') as f:
-                        return f.read()
-                else:
-                    log(f"空文件")
-                    continue
-            except Exception as e:
-                log(f"异常: {str(e)[:100]}")
-                continue
-            finally:
-                try: os.unlink(tmp_path)
-                except: pass
+    # 尝试简单格式
+    simple_formats = ['best', 'worst']
+    for fmt in simple_formats:
+        st.info(f"尝试格式: {fmt}")
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.mp4')
+        os.close(tmp_fd)
+        try:
+            ydl_opts = {
+                'quiet': True, 'no_warnings': True,
+                'format': fmt,
+                'outtmpl': tmp_path,
+                'socket_timeout': 30, 'retries': 3,
+                'ignoreerrors': True, 'geo_bypass': True,
+                'allow_unplayable_formats': True,
+                'extractor_args': {'youtube': ['player_client=web']},
+                'noprogress': True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            size = os.path.getsize(tmp_path)
+            if size > 0:
+                st.success(f"下载成功! 大小: {size/1024/1024:.2f} MB")
+                with open(tmp_path, 'rb') as f:
+                    return f.read()
+            else:
+                st.warning(f"格式 {fmt} 返回 0 字节")
+        except Exception as e:
+            st.warning(f"格式 {fmt} 异常: {e}")
+        finally:
+            try: os.unlink(tmp_path)
+            except: pass
 
-    detail = "; ".join(log_messages[-5:])
-    raise RuntimeError(f"下载失败。exe日志: {last_error}\n库日志最后: {detail}")
+    # 尝试合并流
+    st.info("尝试合并流 (bestvideo+bestaudio)...")
+    for fmt in ['bestvideo+bestaudio', 'bestvideo[height<=720]+bestaudio']:
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.mp4')
+        os.close(tmp_fd)
+        try:
+            ydl_opts = {
+                'quiet': True, 'no_warnings': True,
+                'format': fmt,
+                'outtmpl': tmp_path,
+                'merge_output_format': 'mp4',
+                'socket_timeout': 30, 'retries': 3,
+                'ignoreerrors': True, 'geo_bypass': True,
+                'allow_unplayable_formats': True,
+                'extractor_args': {'youtube': ['player_client=web']},
+                'noprogress': True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            size = os.path.getsize(tmp_path)
+            if size > 0:
+                st.success(f"合并流下载成功! 大小: {size/1024/1024:.2f} MB")
+                with open(tmp_path, 'rb') as f:
+                    return f.read()
+            else:
+                st.warning(f"合并流 {fmt} 返回 0 字节")
+        except Exception as e:
+            st.warning(f"合并流 {fmt} 异常: {e}")
+        finally:
+            try: os.unlink(tmp_path)
+            except: pass
+
+    st.error("所有格式均失败，无法下载。请检查网络或尝试其他视频。")
+    raise RuntimeError("云端下载失败（所有格式空文件）")
 
 # ===== 导入ZIP辅助函数 =====
 def _import_zip_from_bytes(zip_bytes):
