@@ -1,8 +1,8 @@
 """YouTube Liked Downloader - Streamlit 主程序
-本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载（exe自动命名 + 库单流）
-云端模式：仅导入浏览 + 视频下载（库单流，无需合并）
+本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载（exe优先 + pytube降级）
+云端模式：仅导入浏览 + 视频下载（pytube）
 """
-import sys, os, json, zipfile, base64, tempfile, shutil, time, re, sqlite3, yt_dlp, subprocess as sp
+import sys, os, json, zipfile, base64, tempfile, shutil, time, re, sqlite3
 from pathlib import Path
 from io import BytesIO
 from datetime import datetime
@@ -61,13 +61,14 @@ if IS_PORTABLE:
 from core.drive_helper import get_drive_file_list, download_file_from_drive
 from core.packager import pack_clips_into_zip
 
-# ===== 核心下载函数（exe自动命名 + 库单流）=====
+# ===== 核心下载函数（exe优先 + pytube降级）=====
 def download_720p_video(url: str, clip_name: str) -> bytes:
-    """下载视频，本地exe自动命名，云端单流（不合并）"""
+    """下载视频，本地exe优先，云端/降级使用pytube"""
     last_error = ""
 
-    # 1. 本地 exe 模式
+    # 1. 本地 exe 模式（优先）
     if IS_PORTABLE and BIN_DIR:
+        import subprocess as sp
         yt_exe = BIN_DIR / "yt-dlp_2.exe"
         if yt_exe.exists():
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -93,49 +94,29 @@ def download_720p_video(url: str, clip_name: str) -> bytes:
     else:
         last_error = "非便携模式"
 
-    # 2. 云端库模式（单流，不合并）
-    base_opts = {
-        'quiet': True, 'no_warnings': True,
-        'socket_timeout': 60, 'retries': 5, 'fragment_retries': 5,
-        'ignoreerrors': True, 'geo_bypass': True,
-        'writethumbnail': False, 'allow_unplayable_formats': True,
-    }
-    base_opts.pop('merge_output_format', None)
-    base_opts.pop('postprocessor_args', None)
-
-    formats_to_try = ['best', 'best[height<=480]', 'worst']
-    clients_to_try = [['player_client=android'], ['player_client=web'], ['player_client=tv']]
-    last_detail = last_error if last_error else "无exe错误"
-    for client_args in clients_to_try:
-        for fmt in formats_to_try:
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix='.mp4')
-            os.close(tmp_fd)
-            try:
-                ydl_opts = {**base_opts, 'format': fmt, 'outtmpl': tmp_path,
-                            'extractor_args': {'youtube': client_args}}
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    if info is None:
-                        continue
-                    useful = [f for f in info.get('formats', [])
-                              if f.get('vcodec') != 'none' or f.get('acodec') != 'none']
-                    if not useful and fmt != 'worst':
-                        continue
-                    ydl.download([url])
-                if os.path.getsize(tmp_path) > 0:
-                    with open(tmp_path, 'rb') as f:
-                        return f.read()
-                else:
-                    last_detail = f"空文件 (cl={client_args}, fmt={fmt})"
-            except Exception as e:
-                last_detail = f"异常: {str(e)[:200]} (cl={client_args}, fmt={fmt})"
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except:
-                    pass
-
-    raise RuntimeError(f"下载失败。exe日志: {last_error}\n库最后细节: {last_detail}")
+    # 2. 使用 pytube 降级（云端或本地exe失败）
+    try:
+        from pytube import YouTube
+        import io
+        yt = YouTube(url)
+        # 尝试获取最高分辨率的 progressive（音视频合一）流
+        stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
+        if stream is None:
+            # 如果没有progressive，尝试自适应流（仅视频，需要外部合并，此处仅取视频但无音频，但可降级）
+            # 但为了简化，直接取第一个可用的mp4流
+            stream = yt.streams.filter(file_extension='mp4').first()
+        if stream is None:
+            raise RuntimeError("pytube: 无可用mp4流")
+        buffer = io.BytesIO()
+        stream.stream_to_buffer(buffer)
+        data = buffer.getvalue()
+        if len(data) > 0:
+            return data
+        else:
+            raise RuntimeError("pytube: 下载后数据为空")
+    except Exception as e:
+        last_detail = f"pytube异常: {str(e)[:200]}"
+        raise RuntimeError(f"下载失败。exe日志: {last_error}\n库最后细节: {last_detail}")
 
 # ===== 导入ZIP辅助函数 =====
 def _import_zip_from_bytes(zip_bytes):
