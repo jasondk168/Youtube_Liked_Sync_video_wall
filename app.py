@@ -100,7 +100,6 @@ def download_720p_video(url: str, clip_name: str) -> bytes:
         'ignoreerrors': True, 'geo_bypass': True,
         'writethumbnail': False, 'allow_unplayable_formats': True,
     }
-    # 明确移除合并相关选项
     base_opts.pop('merge_output_format', None)
     base_opts.pop('postprocessor_args', None)
 
@@ -116,10 +115,12 @@ def download_720p_video(url: str, clip_name: str) -> bytes:
                             'extractor_args': {'youtube': client_args}}
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
-                    if info is None: continue
-                    useful = [f for f in info.get('formats',[])
-                              if f.get('vcodec')!='none' or f.get('acodec')!='none']
-                    if not useful and fmt != 'worst': continue
+                    if info is None:
+                        continue
+                    useful = [f for f in info.get('formats', [])
+                              if f.get('vcodec') != 'none' or f.get('acodec') != 'none']
+                    if not useful and fmt != 'worst':
+                        continue
                     ydl.download([url])
                 if os.path.getsize(tmp_path) > 0:
                     with open(tmp_path, 'rb') as f:
@@ -129,7 +130,10 @@ def download_720p_video(url: str, clip_name: str) -> bytes:
             except Exception as e:
                 last_detail = f"异常: {str(e)[:200]} (cl={client_args}, fmt={fmt})"
             finally:
-                try: os.unlink(tmp_path); except: pass
+                try:
+                    os.unlink(tmp_path)
+                except:
+                    pass
 
     raise RuntimeError(f"下载失败。exe日志: {last_error}\n库最后细节: {last_detail}")
 
