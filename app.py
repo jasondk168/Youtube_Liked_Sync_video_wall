@@ -1,6 +1,6 @@
 """YouTube Liked Downloader - Streamlit 主程序
 本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载
-云端模式：仅导入浏览 + 稍后观看列表 + 下载 xlsx
+云端模式：仅导入浏览 + 稍后观看列表 + 下载 xlsx（含中文翻译描述）
 """
 import sys, os, json, zipfile, base64, tempfile, shutil, time, re, sqlite3
 from pathlib import Path
@@ -95,21 +95,17 @@ def _import_zip_from_bytes(zip_bytes):
                 try:
                     content = text_bytes.decode('utf-8')
                     lines = content.splitlines()
-                    # 解析Title、Description等
-                    found_title = False
                     in_desc = False
                     desc_lines = []
                     for line in lines:
                         if line.startswith('Title:'):
                             title = line[6:].strip()
-                            found_title = True
                         elif line.startswith('Translated Title:'):
                             translated_title = line[17:].strip()
                         elif line.startswith('Channel:') or line.startswith('Published:') or line.startswith('URL:'):
                             in_desc = False
                         elif line.startswith('Description:'):
                             in_desc = True
-                            # 描述正文可能从下一行开始
                             continue
                         elif in_desc:
                             desc_lines.append(line)
@@ -338,12 +334,14 @@ if mode == "📂 匯入並瀏覽":
         if st.session_state.watch_later:
             count = len(st.session_state.watch_later)
             st.sidebar.info(f"共 {count} 個影片")
-            # 生成 xlsx 下载
+            # 生成 xlsx 下载（包含中文翻译描述）
             if count > 0:
                 df = pd.DataFrame(st.session_state.watch_later)
-                df = df[['index', 'url', 'title', 'description']]
-                df.columns = ['序號', 'YouTube 網址', '影片名稱', '影片介紹']
-                # 导出xlsx
+                # 确保五列都存在（兼容旧条目）
+                if 'description_cn' not in df.columns:
+                    df['description_cn'] = ''
+                df = df[['index', 'url', 'title', 'description', 'description_cn']]
+                df.columns = ['序號', 'YouTube 網址', '影片名稱', '影片介紹', '影片介紹(中文)']
                 output = BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     df.to_excel(writer, index=False, sheet_name='稍後觀看')
@@ -464,6 +462,8 @@ if mode == "📂 匯入並瀏覽":
                         if st.button(f"➕ 添加到_稍後觀看清單", key=f"wl_{i}"):
                             title = entry.get('text', '')[:80]
                             description = entry.get('description', '')[:200]  # 截取200字
+                            # 翻译描述
+                            description_cn = _translate_text(description) if description else ""
                             if not title:
                                 title = url
                             seq = len(st.session_state.watch_later) + 1
@@ -471,7 +471,8 @@ if mode == "📂 匯入並瀏覽":
                                 'index': seq,
                                 'url': url,
                                 'title': title,
-                                'description': description
+                                'description': description,
+                                'description_cn': description_cn
                             })
                             st.success("已加入稍後觀看清單")
                             st.rerun()
