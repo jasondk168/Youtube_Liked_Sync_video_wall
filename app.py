@@ -1,6 +1,6 @@
 """YouTube Liked Downloader - Streamlit 主程序
-本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载（exe自动命名 + 库合并降级）
-云端模式：仅导入浏览 + 视频下载（库合并降级）
+本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载（exe自动命名 + 库单流）
+云端模式：仅导入浏览 + 视频下载（库单流，无需合并）
 """
 import sys, os, json, zipfile, base64, tempfile, shutil, time, re, sqlite3, yt_dlp, subprocess as sp
 from pathlib import Path
@@ -61,57 +61,31 @@ if IS_PORTABLE:
 from core.drive_helper import get_drive_file_list, download_file_from_drive
 from core.packager import pack_clips_into_zip
 
-# ===== 核心下载函数（exe自动命名 + 库合并降级）=====
+# ===== 核心下载函数（exe自动命名 + 库单流）=====
 def download_720p_video(url: str, clip_name: str) -> bytes:
-    """下载视频，本地使用 yt-dlp_2.exe 自动命名，云端使用库合并（ffmpeg 存在）"""
+    """下载视频，本地exe自动命名，云端单流（不合并）"""
     last_error = ""
 
-    # ---- 1. 本地 exe 模式 ----
+    # 1. 本地 exe 模式
     if IS_PORTABLE and BIN_DIR:
         yt_exe = BIN_DIR / "yt-dlp_2.exe"
         if yt_exe.exists():
             with tempfile.TemporaryDirectory() as tmpdir:
                 cwd = Path(tmpdir)
                 try:
-                    # 方案A: 720p
-                    cmd_a = [
-                        str(yt_exe), '-f', 'best[height<=720]',
-                        '--socket-timeout', '60', '--retries', '5',
-                        '--geo-bypass', '--no-check-certificate', '--no-playlist', url
-                    ]
-                    proc = sp.run(cmd_a, capture_output=True, text=True, timeout=600, cwd=tmpdir)
-                    mp4_files = sorted(cwd.glob("*.mp4"), key=lambda x: x.stat().st_size, reverse=True)
-                    for f in mp4_files:
-                        if f.stat().st_size > 0:
-                            with open(f, 'rb') as fp:
-                                return fp.read()
-                    # 方案B: 480p
-                    cmd_b = [
-                        str(yt_exe), '-f', 'best[height<=480]',
-                        '--socket-timeout', '60', '--retries', '5',
-                        '--geo-bypass', '--no-check-certificate', '--no-playlist', url
-                    ]
-                    proc2 = sp.run(cmd_b, capture_output=True, text=True, timeout=600, cwd=tmpdir)
-                    mp4_files2 = sorted(cwd.glob("*.mp4"), key=lambda x: x.stat().st_size, reverse=True)
-                    for f in mp4_files2:
-                        if f.stat().st_size > 0:
-                            with open(f, 'rb') as fp:
-                                return fp.read()
-                    # 方案C: worst
-                    cmd_c = [
-                        str(yt_exe), '-f', 'worst',
-                        '--socket-timeout', '60', '--retries', '5',
-                        '--geo-bypass', '--no-check-certificate', '--no-playlist', url
-                    ]
-                    proc3 = sp.run(cmd_c, capture_output=True, text=True, timeout=600, cwd=tmpdir)
-                    mp4_files3 = sorted(cwd.glob("*.mp4"), key=lambda x: x.stat().st_size, reverse=True)
-                    for f in mp4_files3:
-                        if f.stat().st_size > 0:
-                            with open(f, 'rb') as fp:
-                                return fp.read()
-                    last_error = f"exe三方案均无非空mp4。返回码: A{proc.returncode} B{proc2.returncode} C{proc3.returncode}"
-                except sp.TimeoutExpired:
-                    last_error = "exe执行超时"
+                    for fmt in ['best[height<=720]', 'best[height<=480]', 'worst']:
+                        cmd = [
+                            str(yt_exe), '-f', fmt,
+                            '--socket-timeout', '60', '--retries', '5',
+                            '--geo-bypass', '--no-check-certificate', '--no-playlist', url
+                        ]
+                        sp.run(cmd, capture_output=True, text=True, timeout=600, cwd=tmpdir)
+                        mp4s = sorted(cwd.glob("*.mp4"), key=lambda x: x.stat().st_size, reverse=True)
+                        for f in mp4s:
+                            if f.stat().st_size > 0:
+                                with open(f, 'rb') as fp:
+                                    return fp.read()
+                    last_error = "exe三方案均无非空mp4"
                 except Exception as e:
                     last_error = f"exe异常: {str(e)[:200]}"
         else:
@@ -119,70 +93,45 @@ def download_720p_video(url: str, clip_name: str) -> bytes:
     else:
         last_error = "非便携模式"
 
-    # ---- 2. 回退到 Python 库模式（恢复合并，云端 ffmpeg 已安装）----
+    # 2. 云端库模式（单流，不合并）
     base_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'merge_output_format': 'mp4',
-        'socket_timeout': 60,
-        'retries': 5,
-        'fragment_retries': 5,
-        'ignoreerrors': True,
-        'geo_bypass': True,
-        'writethumbnail': False,
-        'allow_unplayable_formats': True,
+        'quiet': True, 'no_warnings': True,
+        'socket_timeout': 60, 'retries': 5, 'fragment_retries': 5,
+        'ignoreerrors': True, 'geo_bypass': True,
+        'writethumbnail': False, 'allow_unplayable_formats': True,
     }
+    # 明确移除合并相关选项
+    base_opts.pop('merge_output_format', None)
+    base_opts.pop('postprocessor_args', None)
 
-    formats_to_try = [
-        'bestvideo[height<=720]+bestaudio/best[height<=720]',
-        'bestvideo[height<=480]+bestaudio/best[height<=480]',
-        'best[height<=360]/worst',
-    ]
-    clients_to_try = [
-        ['player_client=android'],
-        ['player_client=web'],
-        ['player_client=tv'],
-    ]
+    formats_to_try = ['best', 'best[height<=480]', 'worst']
+    clients_to_try = [['player_client=android'], ['player_client=web'], ['player_client=tv']]
     last_detail = last_error if last_error else "无exe错误"
     for client_args in clients_to_try:
         for fmt in formats_to_try:
             tmp_fd, tmp_path = tempfile.mkstemp(suffix='.mp4')
             os.close(tmp_fd)
             try:
-                ydl_opts = {**base_opts,
-                    'format': fmt,
-                    'outtmpl': tmp_path,
-                    'extractor_args': {'youtube': client_args},
-                }
+                ydl_opts = {**base_opts, 'format': fmt, 'outtmpl': tmp_path,
+                            'extractor_args': {'youtube': client_args}}
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
-                    if info is None:
-                        last_detail = f"extract_info=None (client={client_args}, fmt={fmt})"
-                        continue
-                    all_formats = info.get('formats', [])
-                    useful = [f for f in all_formats if f.get('vcodec') != 'none' or f.get('acodec') != 'none']
-                    if not useful and fmt != 'worst':
-                        last_detail = f"无可用格式 (client={client_args}, fmt={fmt})"
-                        continue
+                    if info is None: continue
+                    useful = [f for f in info.get('formats',[])
+                              if f.get('vcodec')!='none' or f.get('acodec')!='none']
+                    if not useful and fmt != 'worst': continue
                     ydl.download([url])
                 if os.path.getsize(tmp_path) > 0:
                     with open(tmp_path, 'rb') as f:
                         return f.read()
                 else:
-                    last_detail = f"文件为空 (client={client_args}, fmt={fmt})"
-                    continue
+                    last_detail = f"空文件 (cl={client_args}, fmt={fmt})"
             except Exception as e:
-                last_detail = f"异常:{str(e)[:200]} (client={client_args}, fmt={fmt})"
-                continue
+                last_detail = f"异常: {str(e)[:200]} (cl={client_args}, fmt={fmt})"
             finally:
-                try: os.unlink(tmp_path)
-                except: pass
+                try: os.unlink(tmp_path); except: pass
 
-    raise RuntimeError(
-        f"所有画质下载失败(yt-dlp)。\n"
-        f"exe日志: {last_error}\n"
-        f"库最后细节: {last_detail}"
-    )
+    raise RuntimeError(f"下载失败。exe日志: {last_error}\n库最后细节: {last_detail}")
 
 # ===== 导入ZIP辅助函数 =====
 def _import_zip_from_bytes(zip_bytes):
