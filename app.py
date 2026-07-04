@@ -1,6 +1,6 @@
 """YouTube Liked Downloader - Streamlit 主程序
 本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载
-云端模式：仅导入浏览 + 稍后观看列表 + 下载 xlsx（含中文翻译描述）
+云端模式：仅导入浏览 + 稍后观看列表 + 下载 xlsx（含中文翻译描述，已过滤噪音）
 """
 import sys, os, json, zipfile, base64, tempfile, shutil, time, re, sqlite3
 from pathlib import Path
@@ -62,9 +62,8 @@ if IS_PORTABLE:
 from core.drive_helper import get_drive_file_list, download_file_from_drive
 from core.packager import pack_clips_into_zip
 
-# ===== 导入ZIP辅助函数（含描述提取）=====
+# ===== 导入ZIP辅助函数（含描述提取，过滤噪音）=====
 def _import_zip_from_bytes(zip_bytes):
-    """解析ZIP，填充reviews，包含url、标题（中英文）、描述"""
     with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
         if 'manifest.json' not in zf.namelist():
             st.error("ZIP 中缺少 manifest.json")
@@ -87,7 +86,7 @@ def _import_zip_from_bytes(zip_bytes):
             thumb_bytes = None
             if thumbnail_name and (tmp_dir / 'thumbnails' / thumbnail_name).exists():
                 thumb_bytes = (tmp_dir / 'thumbnails' / thumbnail_name).read_bytes()
-            # 从txt解析标题和描述
+            # 从txt解析标题和纯净描述
             title = item.get('text', '')
             description = ''
             translated_title = None
@@ -96,7 +95,7 @@ def _import_zip_from_bytes(zip_bytes):
                     content = text_bytes.decode('utf-8')
                     lines = content.splitlines()
                     in_desc = False
-                    desc_lines = []
+                    desc_raw_lines = []
                     for line in lines:
                         if line.startswith('Title:'):
                             title = line[6:].strip()
@@ -108,9 +107,19 @@ def _import_zip_from_bytes(zip_bytes):
                             in_desc = True
                             continue
                         elif in_desc:
-                            desc_lines.append(line)
-                    if desc_lines:
-                        description = '\n'.join(desc_lines).strip()
+                            desc_raw_lines.append(line)
+                    # 过滤噪音
+                    noise_pattern = re.compile(r'(#|http[s]?://|@|subscribe|订阅|follow|instagram|twitter|channel|youtube|business|\d+k|subscriber)', re.IGNORECASE)
+                    clean_lines = []
+                    for ln in desc_raw_lines:
+                        stripped = ln.strip()
+                        if not stripped:
+                            continue
+                        if noise_pattern.search(stripped):
+                            continue
+                        clean_lines.append(stripped)
+                    if clean_lines:
+                        description = '\n'.join(clean_lines)[:200]
                 except: pass
             if not translated_title and title:
                 translated_title = _translate_text(title)
@@ -161,14 +170,12 @@ if 'download_running' not in st.session_state:
     st.session_state.download_running = False
 if 'selected_clips' not in st.session_state:
     st.session_state.selected_clips = {}
-# 稍后观看列表（云端专用）
 if 'watch_later' not in st.session_state:
     st.session_state.watch_later = []
 
 st.set_page_config(page_title="YouTube Liked Downloader", layout="wide")
 st.title("🎬 YouTube 點讚影片下載 + 手動打包 + 瀏覽")
 
-# ===== 侧边栏菜单 =====
 if IS_PORTABLE:
     mode = st.sidebar.radio("選擇功能", ["📥 同步與打包", "📂 匯入並瀏覽"])
 else:
@@ -323,21 +330,19 @@ if mode == "📥 同步與打包" and IS_PORTABLE:
         else:
             st.info("没有可显示的影片文件。")
 
-# ========== 模式二：匯入並瀏覽（云端与本地均可）==========
+# ========== 模式二：匯入並瀏覽 ==========
 if mode == "📂 匯入並瀏覽":
     st.header("📂 匯入 ZIP 包，瀏覽剪輯")
 
-    # ----- 侧边栏：稍后观看列表（云端专用）-----
+    # ----- 侧边栏：稍后观看列表 -----
     if not IS_PORTABLE:
         st.sidebar.markdown("---")
         st.sidebar.subheader("📋 稍後觀看清單")
         if st.session_state.watch_later:
             count = len(st.session_state.watch_later)
             st.sidebar.info(f"共 {count} 個影片")
-            # 生成 xlsx 下载（包含中文翻译描述）
             if count > 0:
                 df = pd.DataFrame(st.session_state.watch_later)
-                # 确保五列都存在（兼容旧条目）
                 if 'description_cn' not in df.columns:
                     df['description_cn'] = ''
                 df = df[['index', 'url', 'title', 'description', 'description_cn']]
@@ -359,7 +364,7 @@ if mode == "📂 匯入並瀏覽":
         else:
             st.sidebar.info("尚未加入任何影片")
 
-    # ----- 侧边栏：Google Drive 获取 -----
+    # ----- 侧边栏：Google Drive -----
     st.sidebar.subheader("☁️ 從 Google Drive 取得")
     cfg = load_config()
     drive_id = cfg.get("drive_folder_id", "")
@@ -453,7 +458,7 @@ if mode == "📂 匯入並瀏覽":
                 else:
                     st.warning("影片資料缺失")
 
-                # 稍后观看按钮（仅云端显示）
+                # 稍后观看按钮（仅云端）
                 if not IS_PORTABLE and url and url.startswith('http'):
                     already_in = any(item['url'] == url for item in st.session_state.watch_later)
                     if already_in:
@@ -461,8 +466,7 @@ if mode == "📂 匯入並瀏覽":
                     else:
                         if st.button(f"➕ 添加到_稍後觀看清單", key=f"wl_{i}"):
                             title = entry.get('text', '')[:80]
-                            description = entry.get('description', '')[:200]  # 截取200字
-                            # 翻译描述
+                            description = entry.get('description', '')
                             description_cn = _translate_text(description) if description else ""
                             if not title:
                                 title = url
