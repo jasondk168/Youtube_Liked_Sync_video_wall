@@ -1,6 +1,6 @@
 """YouTube Liked Downloader - Streamlit 主程序
-本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载（exe自动命名 + 库降级删除合并）
-云端模式：仅导入浏览 + 视频下载（库降级删除合并）
+本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载（exe自动命名 + 库合并降级）
+云端模式：仅导入浏览 + 视频下载（库合并降级）
 """
 import sys, os, json, zipfile, base64, tempfile, shutil, time, re, sqlite3, yt_dlp, subprocess as sp
 from pathlib import Path
@@ -61,28 +61,23 @@ if IS_PORTABLE:
 from core.drive_helper import get_drive_file_list, download_file_from_drive
 from core.packager import pack_clips_into_zip
 
-# ===== 核心下载函数（exe自动命名 + 库降级删除合并）=====
+# ===== 核心下载函数（exe自动命名 + 库合并降级）=====
 def download_720p_video(url: str, clip_name: str) -> bytes:
-    """下载视频，本地使用 yt-dlp_2.exe 自动命名，降级使用库 best（不合并）"""
+    """下载视频，本地使用 yt-dlp_2.exe 自动命名，云端使用库合并（ffmpeg 存在）"""
     last_error = ""
 
-    # ---- 1. 本地 exe 模式（最可靠）----
+    # ---- 1. 本地 exe 模式 ----
     if IS_PORTABLE and BIN_DIR:
         yt_exe = BIN_DIR / "yt-dlp_2.exe"
         if yt_exe.exists():
             with tempfile.TemporaryDirectory() as tmpdir:
                 cwd = Path(tmpdir)
                 try:
-                    # 方案A: 优先 720p 自适应格式（内置音视频）
+                    # 方案A: 720p
                     cmd_a = [
-                        str(yt_exe),
-                        '-f', 'best[height<=720]',
-                        '--socket-timeout', '60',
-                        '--retries', '5',
-                        '--geo-bypass',
-                        '--no-check-certificate',
-                        '--no-playlist',
-                        url
+                        str(yt_exe), '-f', 'best[height<=720]',
+                        '--socket-timeout', '60', '--retries', '5',
+                        '--geo-bypass', '--no-check-certificate', '--no-playlist', url
                     ]
                     proc = sp.run(cmd_a, capture_output=True, text=True, timeout=600, cwd=tmpdir)
                     mp4_files = sorted(cwd.glob("*.mp4"), key=lambda x: x.stat().st_size, reverse=True)
@@ -90,16 +85,11 @@ def download_720p_video(url: str, clip_name: str) -> bytes:
                         if f.stat().st_size > 0:
                             with open(f, 'rb') as fp:
                                 return fp.read()
-                    # 方案B: 降级到 best[height<=480]
+                    # 方案B: 480p
                     cmd_b = [
-                        str(yt_exe),
-                        '-f', 'best[height<=480]',
-                        '--socket-timeout', '60',
-                        '--retries', '5',
-                        '--geo-bypass',
-                        '--no-check-certificate',
-                        '--no-playlist',
-                        url
+                        str(yt_exe), '-f', 'best[height<=480]',
+                        '--socket-timeout', '60', '--retries', '5',
+                        '--geo-bypass', '--no-check-certificate', '--no-playlist', url
                     ]
                     proc2 = sp.run(cmd_b, capture_output=True, text=True, timeout=600, cwd=tmpdir)
                     mp4_files2 = sorted(cwd.glob("*.mp4"), key=lambda x: x.stat().st_size, reverse=True)
@@ -109,14 +99,9 @@ def download_720p_video(url: str, clip_name: str) -> bytes:
                                 return fp.read()
                     # 方案C: worst
                     cmd_c = [
-                        str(yt_exe),
-                        '-f', 'worst',
-                        '--socket-timeout', '60',
-                        '--retries', '5',
-                        '--geo-bypass',
-                        '--no-check-certificate',
-                        '--no-playlist',
-                        url
+                        str(yt_exe), '-f', 'worst',
+                        '--socket-timeout', '60', '--retries', '5',
+                        '--geo-bypass', '--no-check-certificate', '--no-playlist', url
                     ]
                     proc3 = sp.run(cmd_c, capture_output=True, text=True, timeout=600, cwd=tmpdir)
                     mp4_files3 = sorted(cwd.glob("*.mp4"), key=lambda x: x.stat().st_size, reverse=True)
@@ -124,10 +109,7 @@ def download_720p_video(url: str, clip_name: str) -> bytes:
                         if f.stat().st_size > 0:
                             with open(f, 'rb') as fp:
                                 return fp.read()
-                    last_error = (
-                        f"exe三方案均无非空mp4。返回码: A{proc.returncode} B{proc2.returncode} C{proc3.returncode}。"
-                        f"A输出: {proc.stdout[:100]} {proc.stderr[:100]}"
-                    )
+                    last_error = f"exe三方案均无非空mp4。返回码: A{proc.returncode} B{proc2.returncode} C{proc3.returncode}"
                 except sp.TimeoutExpired:
                     last_error = "exe执行超时"
                 except Exception as e:
@@ -137,22 +119,25 @@ def download_720p_video(url: str, clip_name: str) -> bytes:
     else:
         last_error = "非便携模式"
 
-    # ---- 2. 回退到 Python 库模式（删除合并，直接 best）----
+    # ---- 2. 回退到 Python 库模式（恢复合并，云端 ffmpeg 已安装）----
     base_opts = {
-        'quiet': True, 'no_warnings': True,
-        'socket_timeout': 60, 'retries': 5, 'ignoreerrors': True,
-        'geo_bypass': True, 'writethumbnail': False,
-        'allow_unplayable_formats': True,
-        'format_sort': ['res', 'codec:avc1'],
-        # 禁用合并
-        'merge_output_format': None,
-        'postprocessor_args': [],
+        'quiet': True,
+        'no_warnings': True,
+        'merge_output_format': 'mp4',
+        'socket_timeout': 60,
+        'retries': 5,
+        'fragment_retries': 5,
+        'ignoreerrors': True,
+        'geo_bypass': True,
         'writethumbnail': False,
+        'allow_unplayable_formats': True,
     }
-    # 删除可能存在的 merge 相关键
-    base_opts.pop('postprocessor_args', None)
 
-    formats_to_try = ['best', 'best[height<=480]', 'worst']
+    formats_to_try = [
+        'bestvideo[height<=720]+bestaudio/best[height<=720]',
+        'bestvideo[height<=480]+bestaudio/best[height<=480]',
+        'best[height<=360]/worst',
+    ]
     clients_to_try = [
         ['player_client=android'],
         ['player_client=web'],
@@ -174,8 +159,10 @@ def download_720p_video(url: str, clip_name: str) -> bytes:
                     if info is None:
                         last_detail = f"extract_info=None (client={client_args}, fmt={fmt})"
                         continue
-                    if not info.get('requested_formats') and not info.get('formats'):
-                        last_detail = f"无格式 (client={client_args}, fmt={fmt})"
+                    all_formats = info.get('formats', [])
+                    useful = [f for f in all_formats if f.get('vcodec') != 'none' or f.get('acodec') != 'none']
+                    if not useful and fmt != 'worst':
+                        last_detail = f"无可用格式 (client={client_args}, fmt={fmt})"
                         continue
                     ydl.download([url])
                 if os.path.getsize(tmp_path) > 0:
