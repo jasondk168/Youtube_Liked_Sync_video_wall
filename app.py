@@ -1,28 +1,27 @@
 """YouTube Liked Downloader - Streamlit 主程序
-本地模式：同步并下载 + 手动勾选打包 + 导入浏览
-云端模式：仅导入浏览
-所有标题自动显示中文翻译（优先读取 Translated Title，否则双引擎实时翻译）
+本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载（exe自动命名 + 库降级删除合并）
+云端模式：仅导入浏览 + 视频下载（库降级删除合并）
 """
-import sys, os, json, zipfile, base64, tempfile, shutil, time, re, sqlite3
+import sys, os, json, zipfile, base64, tempfile, shutil, time, re, sqlite3, yt_dlp, subprocess as sp
 from pathlib import Path
 from io import BytesIO
 from datetime import datetime
 import streamlit as st
 import streamlit.components.v1 as components
 
-# ===== 环境检测（必须放在其他导入之前）=====
+# ===== 环境检测 =====
 project_dir = Path(__file__).resolve().parent
 portable_root_candidate = project_dir.parents[1] if len(project_dir.parents) >= 2 else None
 IS_PORTABLE = False
+BIN_DIR = None
 if portable_root_candidate and (portable_root_candidate / "python.exe").exists() and (portable_root_candidate / "bin").exists():
     IS_PORTABLE = True
+    BIN_DIR = portable_root_candidate / "bin"
+    os.environ["PATH"] = str(BIN_DIR) + ";" + os.environ.get("PATH", "")
 
-if IS_PORTABLE:
-    bin_path = portable_root_candidate / "bin"
-    os.environ["PATH"] = str(bin_path) + ";" + os.environ.get("PATH", "")
-
-# ===== 双引擎翻译器（本地优先 googletrans，云端回退 deep-translator）=====
+# ===== 双引擎翻译器 =====
 _translator = None
+_trans_engine = None
 try:
     from googletrans import Translator as GT
     _translator = GT()
@@ -33,12 +32,10 @@ except Exception:
         _translator = DT(source='auto', target='zh-CN')
         _trans_engine = "deep-translator"
     except Exception:
-        _translator = None
-        _trans_engine = None
+        pass
 
 def _translate_text(text: str) -> str:
-    """实时翻译标题为中文，失败返回空字符串"""
-    if not _translator or not text:
+    if not _translator or not text or not _trans_engine:
         return ""
     try:
         if _trans_engine == "googletrans":
@@ -49,7 +46,6 @@ def _translate_text(text: str) -> str:
     except Exception:
         return ""
 
-# ===== 导入自有模块 =====
 from config import (
     IS_PORTABLE as CFG_IS_PORTABLE,
     DATA_DIR, OUTPUT_DIR, PENDING_DIR, CONFIG_FILE,
@@ -65,9 +61,144 @@ if IS_PORTABLE:
 from core.drive_helper import get_drive_file_list, download_file_from_drive
 from core.packager import pack_clips_into_zip
 
-# ===== 辅助函数（放在最前面，避免调用时未定义）=====
+# ===== 核心下载函数（exe自动命名 + 库降级删除合并）=====
+def download_720p_video(url: str, clip_name: str) -> bytes:
+    """下载视频，本地使用 yt-dlp_2.exe 自动命名，降级使用库 best（不合并）"""
+    last_error = ""
+
+    # ---- 1. 本地 exe 模式（最可靠）----
+    if IS_PORTABLE and BIN_DIR:
+        yt_exe = BIN_DIR / "yt-dlp_2.exe"
+        if yt_exe.exists():
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cwd = Path(tmpdir)
+                try:
+                    # 方案A: 优先 720p 自适应格式（内置音视频）
+                    cmd_a = [
+                        str(yt_exe),
+                        '-f', 'best[height<=720]',
+                        '--socket-timeout', '60',
+                        '--retries', '5',
+                        '--geo-bypass',
+                        '--no-check-certificate',
+                        '--no-playlist',
+                        url
+                    ]
+                    proc = sp.run(cmd_a, capture_output=True, text=True, timeout=600, cwd=tmpdir)
+                    mp4_files = sorted(cwd.glob("*.mp4"), key=lambda x: x.stat().st_size, reverse=True)
+                    for f in mp4_files:
+                        if f.stat().st_size > 0:
+                            with open(f, 'rb') as fp:
+                                return fp.read()
+                    # 方案B: 降级到 best[height<=480]
+                    cmd_b = [
+                        str(yt_exe),
+                        '-f', 'best[height<=480]',
+                        '--socket-timeout', '60',
+                        '--retries', '5',
+                        '--geo-bypass',
+                        '--no-check-certificate',
+                        '--no-playlist',
+                        url
+                    ]
+                    proc2 = sp.run(cmd_b, capture_output=True, text=True, timeout=600, cwd=tmpdir)
+                    mp4_files2 = sorted(cwd.glob("*.mp4"), key=lambda x: x.stat().st_size, reverse=True)
+                    for f in mp4_files2:
+                        if f.stat().st_size > 0:
+                            with open(f, 'rb') as fp:
+                                return fp.read()
+                    # 方案C: worst
+                    cmd_c = [
+                        str(yt_exe),
+                        '-f', 'worst',
+                        '--socket-timeout', '60',
+                        '--retries', '5',
+                        '--geo-bypass',
+                        '--no-check-certificate',
+                        '--no-playlist',
+                        url
+                    ]
+                    proc3 = sp.run(cmd_c, capture_output=True, text=True, timeout=600, cwd=tmpdir)
+                    mp4_files3 = sorted(cwd.glob("*.mp4"), key=lambda x: x.stat().st_size, reverse=True)
+                    for f in mp4_files3:
+                        if f.stat().st_size > 0:
+                            with open(f, 'rb') as fp:
+                                return fp.read()
+                    last_error = (
+                        f"exe三方案均无非空mp4。返回码: A{proc.returncode} B{proc2.returncode} C{proc3.returncode}。"
+                        f"A输出: {proc.stdout[:100]} {proc.stderr[:100]}"
+                    )
+                except sp.TimeoutExpired:
+                    last_error = "exe执行超时"
+                except Exception as e:
+                    last_error = f"exe异常: {str(e)[:200]}"
+        else:
+            last_error = "yt-dlp_2.exe 不存在"
+    else:
+        last_error = "非便携模式"
+
+    # ---- 2. 回退到 Python 库模式（删除合并，直接 best）----
+    base_opts = {
+        'quiet': True, 'no_warnings': True,
+        'socket_timeout': 60, 'retries': 5, 'ignoreerrors': True,
+        'geo_bypass': True, 'writethumbnail': False,
+        'allow_unplayable_formats': True,
+        'format_sort': ['res', 'codec:avc1'],
+        # 禁用合并
+        'merge_output_format': None,
+        'postprocessor_args': [],
+        'writethumbnail': False,
+    }
+    # 删除可能存在的 merge 相关键
+    base_opts.pop('postprocessor_args', None)
+
+    formats_to_try = ['best', 'best[height<=480]', 'worst']
+    clients_to_try = [
+        ['player_client=android'],
+        ['player_client=web'],
+        ['player_client=tv'],
+    ]
+    last_detail = last_error if last_error else "无exe错误"
+    for client_args in clients_to_try:
+        for fmt in formats_to_try:
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix='.mp4')
+            os.close(tmp_fd)
+            try:
+                ydl_opts = {**base_opts,
+                    'format': fmt,
+                    'outtmpl': tmp_path,
+                    'extractor_args': {'youtube': client_args},
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if info is None:
+                        last_detail = f"extract_info=None (client={client_args}, fmt={fmt})"
+                        continue
+                    if not info.get('requested_formats') and not info.get('formats'):
+                        last_detail = f"无格式 (client={client_args}, fmt={fmt})"
+                        continue
+                    ydl.download([url])
+                if os.path.getsize(tmp_path) > 0:
+                    with open(tmp_path, 'rb') as f:
+                        return f.read()
+                else:
+                    last_detail = f"文件为空 (client={client_args}, fmt={fmt})"
+                    continue
+            except Exception as e:
+                last_detail = f"异常:{str(e)[:200]} (client={client_args}, fmt={fmt})"
+                continue
+            finally:
+                try: os.unlink(tmp_path)
+                except: pass
+
+    raise RuntimeError(
+        f"所有画质下载失败(yt-dlp)。\n"
+        f"exe日志: {last_error}\n"
+        f"库最后细节: {last_detail}"
+    )
+
+# ===== 导入ZIP辅助函数 =====
 def _import_zip_from_bytes(zip_bytes):
-    """解析 ZIP bytes，填充 st.session_state.reviews，并尝试提取/翻译标题"""
     with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
         if 'manifest.json' not in zf.namelist():
             st.error("ZIP 中缺少 manifest.json")
@@ -92,7 +223,6 @@ def _import_zip_from_bytes(zip_bytes):
             thumb_bytes = None
             if thumbnail_name and (tmp_dir / 'thumbnails' / thumbnail_name).exists():
                 thumb_bytes = (tmp_dir / 'thumbnails' / thumbnail_name).read_bytes()
-            # 优先从 txt 读取翻译标题
             translated_title = None
             if text_bytes:
                 try:
@@ -103,7 +233,6 @@ def _import_zip_from_bytes(zip_bytes):
                             break
                 except Exception:
                     pass
-            # 若没有翻译，实时翻译（仅本地，云端也可尝试）
             if not translated_title and item.get('text'):
                 translated_title = _translate_text(item['text'])
             reviews.append({
@@ -119,12 +248,18 @@ def _import_zip_from_bytes(zip_bytes):
                 'actual_duration': item.get('actual_duration', 0),
             })
         st.session_state.reviews = reviews
+        if 'download_data' not in st.session_state:
+            st.session_state.download_data = {}
+        for r in reviews:
+            key = r['clip_name']
+            if key not in st.session_state.download_data:
+                st.session_state.download_data[key] = {"status": "ready", "data": None, "error": None}
         try:
             shutil.rmtree(tmp_dir)
         except Exception:
             pass
 
-# ===== 初始化目录和数据库 =====
+# ===== 初始化 =====
 if IS_PORTABLE:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -134,7 +269,6 @@ if IS_PORTABLE:
     (PENDING_DIR / "thumbnails").mkdir(exist_ok=True)
     init_database()
 
-# ===== config.json 读写 =====
 def load_config():
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -144,7 +278,7 @@ def save_config(cfg):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-# ===== session_state 初始化 =====
+# ===== session_state =====
 if 'reviews' not in st.session_state:
     st.session_state.reviews = []
 if 'drive_file_list' not in st.session_state:
@@ -155,12 +289,12 @@ if 'download_running' not in st.session_state:
     st.session_state.download_running = False
 if 'selected_clips' not in st.session_state:
     st.session_state.selected_clips = {}
+if 'download_data' not in st.session_state:
+    st.session_state.download_data = {}
 
-# ===== Streamlit 页面 =====
 st.set_page_config(page_title="YouTube Liked Downloader", layout="wide")
 st.title("🎬 YouTube 點讚影片下載 + 手動打包 + 瀏覽")
 
-# ===== 侧边栏菜单 =====
 if IS_PORTABLE:
     mode = st.sidebar.radio("選擇功能", ["📥 同步與打包", "📂 匯入並瀏覽"])
 else:
@@ -170,51 +304,37 @@ else:
 # ========== 模式一：同步與打包 ==========
 if mode == "📥 同步與打包" and IS_PORTABLE:
     st.header("📥 同步點讚影片並下載 480P（手動勾選打包）")
-
     pending_count = get_pending_count()
     st.sidebar.info(f"📦 已下載待打包影片：{pending_count}")
-
     if st.button("🔄 開始同步並下載", type="primary", disabled=st.session_state.download_running):
         st.session_state.download_running = True
         try:
             youtube = get_authenticated_service()
             videos = get_liked_videos(youtube, max_results=0)
             st.info(f"取得 {len(videos)} 個點讚影片")
-
             new_vids = [v for v in videos if not is_already_downloaded(v['video_id'])]
             if not new_vids:
                 st.success("所有點讚影片均已下載過！")
                 st.session_state.download_running = False
                 st.stop()
-
             st.info(f"需要下載 {len(new_vids)} 個新影片")
-
-            # 获取当前 pending 中最大的序号（从 clips 子目录读取）
             existing_clips = sorted([p.stem for p in (PENDING_DIR / "clips").glob("Clip_*.mp4")])
             next_index = 1
             if existing_clips:
                 max_num = max(int(f.split('_')[1]) for f in existing_clips)
                 next_index = max_num + 1
-
             progress_bar = st.progress(0)
             status_text = st.empty()
-
             for i, v in enumerate(new_vids):
                 status_text.text(f"正在下載 ({i+1}/{len(new_vids)}): {v['title'][:50]}...")
                 try:
                     clip_idx = next_index + i
                     entry = download_video_480p(v['url'], clip_idx, PENDING_DIR)
-                    mark_downloaded(
-                        video_id=v['video_id'],
-                        title=v['title'],
-                        url=v['url'],
-                        clip_name=entry['clip_name'],
-                        status='pending'
-                    )
+                    mark_downloaded(video_id=v['video_id'], title=v['title'], url=v['url'],
+                                    clip_name=entry['clip_name'], status='pending')
                 except Exception as e:
                     st.warning(f"下載失敗 {v['url']}: {e}")
                 progress_bar.progress((i+1)/len(new_vids))
-
             st.session_state.download_running = False
             st.success(f"下載完成，新增 {len(new_vids)} 個影片到待打包區")
             st.rerun()
@@ -222,18 +342,15 @@ if mode == "📥 同步與打包" and IS_PORTABLE:
             st.error(f"錯誤：{e}")
             st.session_state.download_running = False
 
-    # ---------- 手动选择打包区域 ----------
+    # 手动打包区域
     st.markdown("---")
     st.subheader("📋 待打包影片清單（勾選要打包的影片）")
-
     pending_clips = sorted((PENDING_DIR / "clips").glob("Clip_*.mp4"))
-
     if st.checkbox("顯示偵錯資訊", value=False):
         st.write(f"PENDING_DIR: {PENDING_DIR}")
         st.write(f"找到檔案數: {len(pending_clips)}")
         for p in pending_clips:
             st.write(p.name)
-
     if not pending_clips:
         st.info("目前沒有待打包的影片，請先執行同步下載。")
     else:
@@ -257,35 +374,22 @@ if mode == "📥 同步與打包" and IS_PORTABLE:
                             title = line[6:].strip()
                             break
                 video_id = ""
-            clip_info_list.append({
-                "clip_name": clip_name,
-                "title": title,
-                "video_id": video_id
-            })
+            clip_info_list.append({"clip_name": clip_name, "title": title, "video_id": video_id})
         conn.close()
-
-        if not clip_info_list:
-            st.info("没有可显示的影片文件。")
-        else:
+        if clip_info_list:
             col_list, col_btn = st.columns([3, 1])
             with col_list:
                 for info in clip_info_list:
                     key = info['clip_name']
-                    checked = st.checkbox(
-                        f"**{key}**：{info['title'][:60]}",
-                        key=f"chk_{key}",
-                        value=st.session_state.selected_clips.get(key, False)
-                    )
+                    checked = st.checkbox(f"**{key}**：{info['title'][:60]}", key=f"chk_{key}",
+                                          value=st.session_state.selected_clips.get(key, False))
                     st.session_state.selected_clips[key] = checked
-
             with col_btn:
                 st.write("")
                 if st.button("🔄 刷新清單"):
                     st.rerun()
-
             selected_names = [name for name, sel in st.session_state.selected_clips.items() if sel]
             selected_count = len(selected_names)
-
             if selected_count == 0:
                 st.info(f"請勾選影片後點擊打包（至少勾選 {VIDEOS_PER_PACK} 個）")
             elif selected_count < VIDEOS_PER_PACK:
@@ -319,43 +423,36 @@ if mode == "📥 同步與打包" and IS_PORTABLE:
                             'clip_name': clip_name,
                             'text_name': clip_name.replace('.mp4', '.txt'),
                             'thumbnail_name': clip_name.replace('.mp4', '.jpg') if thumb_path.exists() else None,
-                            'title': title,
-                            'url': url,
-                            'actual_duration': 0,
-                            'clip_path': str(clip_path),
-                            'text_path': str(text_path),
+                            'title': title, 'url': url, 'actual_duration': 0,
+                            'clip_path': str(clip_path), 'text_path': str(text_path),
                             'thumbnail_path': str(thumb_path) if thumb_path.exists() else None,
                             'video_id': video_id
                         })
-
                     first_title = clip_entries[0].get('title', 'video')
                     safe_title = re.sub(r'[\\/:*?"<>|]', '_', first_title)[:50]
                     now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                     zip_name = f"{safe_title}_{now_str}.zip"
                     zip_path = OUTPUT_DIR / zip_name
                     zip_path = pack_clips_into_zip(clip_entries, 1, OUTPUT_DIR)
-
                     for entry in clip_entries:
                         Path(entry['clip_path']).unlink(missing_ok=True)
                         Path(entry['text_path']).unlink(missing_ok=True)
                         if entry.get('thumbnail_path'):
                             Path(entry['thumbnail_path']).unlink(missing_ok=True)
-
                     for entry in clip_entries:
                         if entry['video_id']:
                             update_status(entry['video_id'], 'zipped', zip_name)
-
                     for name in pack_names:
                         st.session_state.selected_clips.pop(name, None)
-
                     st.success(f"打包完成：{zip_name}")
                     st.rerun()
+        else:
+            st.info("没有可显示的影片文件。")
 
 # ========== 模式二：匯入並瀏覽 ==========
 if mode == "📂 匯入並瀏覽":
     st.header("📂 匯入 ZIP 包，瀏覽剪輯")
-
-    # ----- 侧边栏：Google Drive 获取 -----
+    # Google Drive
     st.sidebar.subheader("☁️ 從 Google Drive 取得")
     cfg = load_config()
     drive_id = cfg.get("drive_folder_id", "")
@@ -392,7 +489,7 @@ if mode == "📂 匯入並瀏覽":
                 except Exception as e:
                     st.error(f"下載/匯入失敗：{e}")
 
-    # ----- 侧边栏：本地上传 -----
+    # 本地上传
     st.sidebar.subheader("📁 本地上傳 ZIP")
     uploaded_zip = st.sidebar.file_uploader("選擇 .zip 檔案", type=["zip"], key="upload_zip")
     if uploaded_zip is not None:
@@ -402,7 +499,7 @@ if mode == "📂 匯入並瀏覽":
         except Exception as e:
             st.error(f"匯入失敗：{e}")
 
-    # ----- 主区域：双行展示（含中英文标题、自适应播放器） -----
+    # 双行展示 + 下载按钮
     if not st.session_state.reviews:
         st.info("請透過側邊欄上傳或從 Google Drive 匯入一個 ZIP 檔案")
     else:
@@ -417,7 +514,6 @@ if mode == "📂 匯入並瀏覽":
                 else:
                     display_text = raw_title
                 st.markdown(f"**{entry.get('index', i+1):03d}**  {display_text}")
-
                 text_bytes = entry.get('text_bytes')
                 if text_bytes:
                     st.text_area("文字內容", text_bytes.decode('utf-8', errors='ignore'), height=200)
@@ -426,9 +522,11 @@ if mode == "📂 匯入並瀏覽":
                     st.image(thumb_bytes, width=150)
             with col_b:
                 clip_bytes = entry.get('clip_bytes')
+                url = entry.get('url', '')
+                clip_name = entry.get('clip_name', f"clip_{i}.mp4")
                 if clip_bytes:
                     b64 = base64.b64encode(clip_bytes).decode()
-                    ext = entry.get('clip_name', 'clip.mp4').rsplit('.', 1)[-1].lower()
+                    ext = clip_name.rsplit('.', 1)[-1].lower()
                     mime = 'video/mp4' if ext == 'mp4' else f'video/{ext}'
                     uid = f"vid_{i}_{int(time.time())}"
                     html = f"""
@@ -437,14 +535,52 @@ if mode == "📂 匯入並瀏覽":
                             <source src="data:{mime};base64,{b64}" type="{mime}">
                         </video>
                         <div style="display:flex; gap:8px; flex-wrap:wrap;">
-                            <button onclick="document.getElementById('{uid}').play()" style="padding:4px 12px; border:1px solid #888; border-radius:4px; background:#f0f0f0; cursor:pointer;">▶ 播放</button>
-                            <button onclick="document.getElementById('{uid}').pause()" style="padding:4px 12px; border:1px solid #888; border-radius:4px; background:#f0f0f0; cursor:pointer;">⏸ 暫停</button>
-                            <button onclick="var v=document.getElementById('{uid}'); v.pause(); v.currentTime=0;" style="padding:4px 12px; border:1px solid #888; border-radius:4px; background:#f0f0f0; cursor:pointer;">⏹ 停止</button>
-                            <button onclick="var v=document.getElementById('{uid}'); if(v.requestFullscreen) v.requestFullscreen();" style="padding:4px 12px; border:1px solid #888; border-radius:4px; background:#f0f0f0; cursor:pointer;">⛶ 全螢幕</button>
+                            <button onclick="document.getElementById('{uid}').play()" style="padding:4px 12px;">▶ 播放</button>
+                            <button onclick="document.getElementById('{uid}').pause()" style="padding:4px 12px;">⏸ 暫停</button>
+                            <button onclick="var v=document.getElementById('{uid}'); v.pause(); v.currentTime=0;" style="padding:4px 12px;">⏹ 停止</button>
+                            <button onclick="var v=document.getElementById('{uid}'); if(v.requestFullscreen) v.requestFullscreen();" style="padding:4px 12px;">⛶ 全螢幕</button>
                         </div>
                     </div>
                     """
                     components.html(html, height=450)
                 else:
                     st.warning("影片資料缺失")
+
+                # 下载720P按钮
+                if url and url.startswith('http'):
+                    key = entry['clip_name']
+                    dd = st.session_state.download_data.get(key, {"status": "ready", "data": None, "error": None})
+                    if dd["status"] == "ready":
+                        if st.button(f"⬇️ 下載 720P", key=f"dl_{key}"):
+                            dd["status"] = "downloading"
+                            st.rerun()
+                    elif dd["status"] == "downloading":
+                        with st.spinner("正在下載，請稍候..."):
+                            try:
+                                data = download_720p_video(url, key)
+                                if data and len(data) > 0:
+                                    dd["data"] = data
+                                    dd["status"] = "done"
+                                else:
+                                    dd["error"] = "下載結果為空"
+                                    dd["status"] = "error"
+                            except Exception as e:
+                                dd["error"] = str(e)
+                                dd["status"] = "error"
+                            st.rerun()
+                    elif dd["status"] == "done":
+                        st.download_button(
+                            label="📥 點我儲存",
+                            data=dd["data"],
+                            file_name=f"{key.replace('.mp4', '')}_downloaded.mp4",
+                            mime="video/mp4",
+                            key=f"save_{key}"
+                        )
+                    elif dd["status"] == "error":
+                        st.error(f"下載失敗：{dd['error']}")
+                        if st.button("🔄 重試", key=f"retry_{key}"):
+                            dd["status"] = "ready"
+                            st.rerun()
+                else:
+                    st.info("無 YouTube 連結，無法下載")
             st.markdown("---")
