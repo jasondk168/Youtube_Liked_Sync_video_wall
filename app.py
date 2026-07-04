@@ -1,6 +1,6 @@
 """YouTube Liked Downloader - Streamlit 主程序
-本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载（exe优先 + 库单流）
-云端模式：仅导入浏览 + 视频下载（库单流，无合并）
+本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载（exe优先 + 库单流/合并）
+云端模式：仅导入浏览 + 视频下载（库单流/合并）
 """
 import sys, os, json, zipfile, base64, tempfile, shutil, time, re, sqlite3, yt_dlp
 from pathlib import Path
@@ -61,10 +61,16 @@ if IS_PORTABLE:
 from core.drive_helper import get_drive_file_list, download_file_from_drive
 from core.packager import pack_clips_into_zip
 
-# ===== 核心下载函数（exe优先 + 库单流，不合并）=====
+# ===== 核心下载函数（exe优先 + 库单流/合并）=====
 def download_720p_video(url: str, clip_name: str) -> bytes:
-    """下载视频，本地exe优先，云端使用yt-dlp库单流（不合并）"""
+    """下载视频，本地exe优先，云端使用yt-dlp库（先单流，后合并）"""
     last_error = ""
+    log_messages = []
+
+    def log(msg):
+        log_messages.append(msg)
+        # 可选：print 到流日志
+        print(f"[download_720p] {msg}")
 
     # 1. 本地 exe 模式（优先）
     if IS_PORTABLE and BIN_DIR:
@@ -73,92 +79,119 @@ def download_720p_video(url: str, clip_name: str) -> bytes:
         if yt_exe.exists():
             with tempfile.TemporaryDirectory() as tmpdir:
                 cwd = Path(tmpdir)
-                try:
-                    for fmt in ['best[height<=720]', 'best[height<=480]', 'worst']:
+                for fmt in ['best[height<=720]', 'best[height<=480]', 'worst']:
+                    try:
                         cmd = [
                             str(yt_exe), '-f', fmt,
                             '--socket-timeout', '60', '--retries', '5',
-                            '--geo-bypass', '--no-check-certificate', '--no-playlist', url
+                            '--geo-bypass', '--no-check-certificate', '--no-playlist',
+                            '-o', '%(title)s.%(ext)s', url
                         ]
                         sp.run(cmd, capture_output=True, text=True, timeout=600, cwd=tmpdir)
                         mp4s = sorted(cwd.glob("*.mp4"), key=lambda x: x.stat().st_size, reverse=True)
                         for f in mp4s:
                             if f.stat().st_size > 0:
-                                with open(f, 'rb') as fp:
-                                    return fp.read()
-                    last_error = "exe三方案均无非空mp4"
-                except Exception as e:
-                    last_error = f"exe异常: {str(e)[:200]}"
+                                return f.read_bytes()
+                    except Exception as e:
+                        log(f"exe {fmt} 失败: {str(e)[:80]}")
+                        continue
+            last_error = "exe 三方案均无有效文件"
         else:
             last_error = "yt-dlp_2.exe 不存在"
     else:
         last_error = "非便携模式"
 
-    # 2. yt-dlp 库模式（单流，不合并，适用于云端）
-    # 先确认云端是否已安装ffmpeg（通过packages.txt），但我们仍然避免合并
-    # 只下载包含音视频的单个流
-    formats_to_try = [
+    # 2. yt-dlp 库模式
+    format_list = [
         'best[height<=720][acodec!=none][vcodec!=none]',
         'best[height<=480][acodec!=none][vcodec!=none]',
         'best[acodec!=none][vcodec!=none]',
+        'worst[acodec!=none][vcodec!=none]',
         'worst',
     ]
-    clients_to_try = [
-        ['player_client=android', 'skip_webpage=True'],
-        ['player_client=web', 'skip_webpage=False'],
-        ['player_client=tv'],
+    client_variants = [
+        {'player_client': 'web', 'skip_webpage': False},
+        {'player_client': 'android', 'skip_webpage': True},
+        {'player_client': 'ios', 'skip_webpage': True},
+        {'player_client': 'tv', 'skip_webpage': True},
     ]
     base_opts = {
         'quiet': True, 'no_warnings': True,
-        'socket_timeout': 60, 'retries': 5, 'fragment_retries': 5,
+        'socket_timeout': 30, 'retries': 3, 'fragment_retries': 3,
         'ignoreerrors': True, 'geo_bypass': True,
-        'writethumbnail': False, 'allow_unplayable_formats': True,
-        # 明确禁用任何后处理
-        'postprocessor_args': [],
+        'allow_unplayable_formats': True,
+        'postprocessors': [],
         'merge_output_format': None,
+        'extractor_retries': 3,
     }
-    # 移除可能存在的merge键
-    base_opts.pop('merge_output_format', None)
-    base_opts.pop('postprocessor_args', None)
 
-    last_detail = last_error if last_error else "无exe错误"
-    for client_args in clients_to_try:
-        for fmt in formats_to_try:
+    # 尝试单流
+    for client_cfg in client_variants:
+        for fmt in format_list:
+            log(f"尝试单流: cl={client_cfg.get('player_client')}, fmt={fmt}")
             tmp_fd, tmp_path = tempfile.mkstemp(suffix='.mp4')
             os.close(tmp_fd)
             try:
-                ydl_opts = {**base_opts,
+                ydl_opts = {
+                    **base_opts,
                     'format': fmt,
                     'outtmpl': tmp_path,
-                    'extractor_args': {'youtube': client_args},
+                    'extractor_args': {'youtube': [f"{k}={v}" for k, v in client_cfg.items()]},
                 }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    # 先检查是否有可用格式
-                    info = ydl.extract_info(url, download=False)
-                    if info is None:
-                        last_detail = f"extract_info=None (cl={client_args}, fmt={fmt})"
-                        continue
-                    # 检查是否有匹配该格式的流
-                    if fmt != 'worst':
-                        # 简单判断：检查 requested_formats 或 formats 是否有内容
-                        pass
                     ydl.download([url])
-                if os.path.getsize(tmp_path) > 0:
+                size = os.path.getsize(tmp_path)
+                if size > 0:
                     with open(tmp_path, 'rb') as f:
                         return f.read()
                 else:
-                    last_detail = f"空文件 (cl={client_args}, fmt={fmt})"
+                    log(f"空文件, size=0")
                     continue
             except Exception as e:
-                last_detail = f"异常: {str(e)[:200]} (cl={client_args}, fmt={fmt})"
+                log(f"异常: {str(e)[:100]}")
                 continue
             finally:
-                try:
-                    os.unlink(tmp_path)
-                except:
-                    pass
+                try: os.unlink(tmp_path)
+                except: pass
 
-    raise RuntimeError(f"下载失败。exe日志: {last_error}\n库最后细节: {last_detail}")
+    # 尝试合并流（需要ffmpeg）
+    log("单流均失败，尝试合并流...")
+    merge_formats = [
+        'bestvideo[height<=720]+bestaudio/best[height<=720]',
+        'bestvideo[height<=480]+bestaudio/best[height<=480]',
+        'bestvideo+bestaudio/best',
+    ]
+    for client_cfg in client_variants:
+        for fmt in merge_formats:
+            log(f"尝试合并: cl={client_cfg.get('player_client')}, fmt={fmt}")
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix='.mp4')
+            os.close(tmp_fd)
+            try:
+                ydl_opts = {
+                    **base_opts,
+                    'format': fmt,
+                    'outtmpl': tmp_path,
+                    'merge_output_format': 'mp4',
+                    'extractor_args': {'youtube': [f"{k}={v}" for k, v in client_cfg.items()]},
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                size = os.path.getsize(tmp_path)
+                if size > 0:
+                    with open(tmp_path, 'rb') as f:
+                        return f.read()
+                else:
+                    log(f"空文件")
+                    continue
+            except Exception as e:
+                log(f"异常: {str(e)[:100]}")
+                continue
+            finally:
+                try: os.unlink(tmp_path)
+                except: pass
+
+    detail = "; ".join(log_messages[-5:])
+    raise RuntimeError(f"下载失败。exe日志: {last_error}\n库日志最后: {detail}")
 
 # ===== 导入ZIP辅助函数 =====
 def _import_zip_from_bytes(zip_bytes):
@@ -172,10 +205,8 @@ def _import_zip_from_bytes(zip_bytes):
             st.warning("manifest 中沒有條目")
             return
         tmp_dir = Path(tempfile.mkdtemp())
-        try:
-            zf.extractall(tmp_dir)
-        except Exception:
-            pass
+        try: zf.extractall(tmp_dir)
+        except: pass
         reviews = []
         for item in items:
             clip_name = item['clip_name']
@@ -194,8 +225,7 @@ def _import_zip_from_bytes(zip_bytes):
                         if line.startswith('Translated Title:'):
                             translated_title = line[17:].strip()
                             break
-                except Exception:
-                    pass
+                except: pass
             if not translated_title and item.get('text'):
                 translated_title = _translate_text(item['text'])
             reviews.append({
@@ -217,10 +247,8 @@ def _import_zip_from_bytes(zip_bytes):
             key = r['clip_name']
             if key not in st.session_state.download_data:
                 st.session_state.download_data[key] = {"status": "ready", "data": None, "error": None}
-        try:
-            shutil.rmtree(tmp_dir)
-        except Exception:
-            pass
+        try: shutil.rmtree(tmp_dir)
+        except: pass
 
 # ===== 初始化 =====
 if IS_PORTABLE:
@@ -305,9 +333,7 @@ if mode == "📥 同步與打包" and IS_PORTABLE:
             st.error(f"錯誤：{e}")
             st.session_state.download_running = False
 
-    # 手动打包区域（完整保留，为节省篇幅此处省略，实际请保持原有完整代码）
-    # 在此处插入完整打包代码（与之前版本相同，约200行）
-    # 您可以从之前的版本中复制手动打包区域粘贴至此。
+    # ---------- 手动选择打包区域 ----------
     st.markdown("---")
     st.subheader("📋 待打包影片清單（勾選要打包的影片）")
     pending_clips = sorted((PENDING_DIR / "clips").glob("Clip_*.mp4"))
@@ -453,7 +479,6 @@ if mode == "📂 匯入並瀏覽":
                     st.success(f"已從 Google Drive 匯入 {selected_file['name']}")
                 except Exception as e:
                     st.error(f"下載/匯入失敗：{e}")
-
     # 本地上传
     st.sidebar.subheader("📁 本地上傳 ZIP")
     uploaded_zip = st.sidebar.file_uploader("選擇 .zip 檔案", type=["zip"], key="upload_zip")
