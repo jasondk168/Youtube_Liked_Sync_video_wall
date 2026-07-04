@@ -1,5 +1,5 @@
 """YouTube Liked Downloader - Streamlit 主程序
-本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载（exe优先 + pytube降级）
+本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载（exe优先 + pytube云端）
 云端模式：仅导入浏览 + 视频下载（pytube）
 """
 import sys, os, json, zipfile, base64, tempfile, shutil, time, re, sqlite3
@@ -63,7 +63,7 @@ from core.packager import pack_clips_into_zip
 
 # ===== 核心下载函数（exe优先 + pytube降级）=====
 def download_720p_video(url: str, clip_name: str) -> bytes:
-    """下载视频，本地exe优先，云端/降级使用pytube"""
+    """下载视频，本地exe优先，云端使用pytube（含po_token）"""
     last_error = ""
 
     # 1. 本地 exe 模式（优先）
@@ -94,18 +94,18 @@ def download_720p_video(url: str, clip_name: str) -> bytes:
     else:
         last_error = "非便携模式"
 
-    # 2. 使用 pytube 降级（云端或本地exe失败）
+    # 2. 使用 pytube（云端或降级）
     try:
         from pytube import YouTube
         import io
-        yt = YouTube(url)
-        # 尝试获取最高分辨率的 progressive（音视频合一）流
+        # 使用最新pytube参数以避免HTTP 400
+        yt = YouTube(url, use_oauth=False, allow_oauth_cache=False, use_po_token=True)
+        # 优先选择progressive（音视频合一）且分辨率最高的mp4
         stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
-        if stream is None:
-            # 如果没有progressive，尝试自适应流（仅视频，需要外部合并，此处仅取视频但无音频，但可降级）
-            # 但为了简化，直接取第一个可用的mp4流
-            stream = yt.streams.filter(file_extension='mp4').first()
-        if stream is None:
+        if not stream:
+            # 若无progressive，选择任何mp4流（可能只有视频无音频）
+            stream = yt.streams.filter(file_extension='mp4').order_by('resolution').desc().first()
+        if not stream:
             raise RuntimeError("pytube: 无可用mp4流")
         buffer = io.BytesIO()
         stream.stream_to_buffer(buffer)
@@ -115,8 +115,36 @@ def download_720p_video(url: str, clip_name: str) -> bytes:
         else:
             raise RuntimeError("pytube: 下载后数据为空")
     except Exception as e:
-        last_detail = f"pytube异常: {str(e)[:200]}"
-        raise RuntimeError(f"下载失败。exe日志: {last_error}\n库最后细节: {last_detail}")
+        last_detail = f"pytube异常: {str(e)[:300]}"
+        # 如果pytube失败，尝试yt-dlp库的单流模式（云端可能已安装ffmpeg，但尝试不合并）
+        try:
+            import yt_dlp
+            with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                ydl_opts = {
+                    'quiet': True, 'no_warnings': True,
+                    'format': 'best[height<=720]',
+                    'outtmpl': tmp_path,
+                    'socket_timeout': 60, 'retries': 5,
+                    'ignoreerrors': True, 'geo_bypass': True,
+                    'writethumbnail': False,
+                    'allow_unplayable_formats': True,
+                    'extractor_args': {'youtube': ['player_client=android', 'skip_webpage=True']},
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                if os.path.getsize(tmp_path) > 0:
+                    with open(tmp_path, 'rb') as f:
+                        return f.read()
+                else:
+                    raise RuntimeError("yt-dlp库文件为空")
+            finally:
+                try: os.unlink(tmp_path)
+                except: pass
+        except Exception as e2:
+            last_detail += f"; yt-dlp库也失败: {str(e2)[:200]}"
+            raise RuntimeError(f"下载失败。exe日志: {last_error}\n最后细节: {last_detail}")
 
 # ===== 导入ZIP辅助函数 =====
 def _import_zip_from_bytes(zip_bytes):
@@ -263,7 +291,7 @@ if mode == "📥 同步與打包" and IS_PORTABLE:
             st.error(f"錯誤：{e}")
             st.session_state.download_running = False
 
-    # 手动打包区域
+    # 手动打包区域（完整保留，为节省篇幅仅保留占位，实际请保持原有完整代码）
     st.markdown("---")
     st.subheader("📋 待打包影片清單（勾選要打包的影片）")
     pending_clips = sorted((PENDING_DIR / "clips").glob("Clip_*.mp4"))
