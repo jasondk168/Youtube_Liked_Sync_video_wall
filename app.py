@@ -1,6 +1,6 @@
 """YouTube Liked Downloader - Streamlit 主程序
 本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载
-云端模式：仅导入浏览 + 稍后观看列表 + 下载列表
+云端模式：仅导入浏览 + 稍后观看列表 + 下载 xlsx
 """
 import sys, os, json, zipfile, base64, tempfile, shutil, time, re, sqlite3
 from pathlib import Path
@@ -8,6 +8,7 @@ from io import BytesIO
 from datetime import datetime
 import streamlit as st
 import streamlit.components.v1 as components
+import pandas as pd
 
 # ===== 环境检测 =====
 project_dir = Path(__file__).resolve().parent
@@ -61,9 +62,9 @@ if IS_PORTABLE:
 from core.drive_helper import get_drive_file_list, download_file_from_drive
 from core.packager import pack_clips_into_zip
 
-# ===== 导入ZIP辅助函数 =====
+# ===== 导入ZIP辅助函数（含描述提取）=====
 def _import_zip_from_bytes(zip_bytes):
-    """解析ZIP，填充reviews，并初始化稍后观看状态"""
+    """解析ZIP，填充reviews，包含url、标题（中英文）、描述"""
     with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
         if 'manifest.json' not in zf.namelist():
             st.error("ZIP 中缺少 manifest.json")
@@ -86,20 +87,41 @@ def _import_zip_from_bytes(zip_bytes):
             thumb_bytes = None
             if thumbnail_name and (tmp_dir / 'thumbnails' / thumbnail_name).exists():
                 thumb_bytes = (tmp_dir / 'thumbnails' / thumbnail_name).read_bytes()
+            # 从txt解析标题和描述
+            title = item.get('text', '')
+            description = ''
             translated_title = None
             if text_bytes:
                 try:
                     content = text_bytes.decode('utf-8')
-                    for line in content.splitlines():
-                        if line.startswith('Translated Title:'):
+                    lines = content.splitlines()
+                    # 解析Title、Description等
+                    found_title = False
+                    in_desc = False
+                    desc_lines = []
+                    for line in lines:
+                        if line.startswith('Title:'):
+                            title = line[6:].strip()
+                            found_title = True
+                        elif line.startswith('Translated Title:'):
                             translated_title = line[17:].strip()
-                            break
+                        elif line.startswith('Channel:') or line.startswith('Published:') or line.startswith('URL:'):
+                            in_desc = False
+                        elif line.startswith('Description:'):
+                            in_desc = True
+                            # 描述正文可能从下一行开始
+                            continue
+                        elif in_desc:
+                            desc_lines.append(line)
+                    if desc_lines:
+                        description = '\n'.join(desc_lines).strip()
                 except: pass
-            if not translated_title and item.get('text'):
-                translated_title = _translate_text(item['text'])
+            if not translated_title and title:
+                translated_title = _translate_text(title)
             reviews.append({
                 'index': item.get('index', idx+1),
-                'text': item.get('text', ''),
+                'text': title,
+                'description': description,
                 'translated_title': translated_title,
                 'clip_name': clip_name,
                 'text_name': text_name,
@@ -316,19 +338,23 @@ if mode == "📂 匯入並瀏覽":
         if st.session_state.watch_later:
             count = len(st.session_state.watch_later)
             st.sidebar.info(f"共 {count} 個影片")
-            # 下载列表按钮
-            lines = []
-            for item in st.session_state.watch_later:
-                lines.append(f"{item['index']:03d}. {item['title']} - {item['url']}")
-            list_text = "\n".join(lines)
-            st.sidebar.download_button(
-                label="📥 下載清單 (txt)",
-                data=list_text,
-                file_name="稍後觀看清單.txt",
-                mime="text/plain",
-                key="download_watch_later"
-            )
-            # 清空按钮
+            # 生成 xlsx 下载
+            if count > 0:
+                df = pd.DataFrame(st.session_state.watch_later)
+                df = df[['index', 'url', 'title', 'description']]
+                df.columns = ['序號', 'YouTube 網址', '影片名稱', '影片介紹']
+                # 导出xlsx
+                output = BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df.to_excel(writer, index=False, sheet_name='稍後觀看')
+                xlsx_data = output.getvalue()
+                st.sidebar.download_button(
+                    label="📥 下載清單 (.xlsx)",
+                    data=xlsx_data,
+                    file_name="稍後觀看清單.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="download_watch_later_xlsx"
+                )
             if st.sidebar.button("🗑️ 清空清單"):
                 st.session_state.watch_later = []
                 st.rerun()
@@ -431,21 +457,21 @@ if mode == "📂 匯入並瀏覽":
 
                 # 稍后观看按钮（仅云端显示）
                 if not IS_PORTABLE and url and url.startswith('http'):
-                    # 检查是否已在列表中
                     already_in = any(item['url'] == url for item in st.session_state.watch_later)
                     if already_in:
                         st.info("✅ 已加入稍後觀看清單")
                     else:
                         if st.button(f"➕ 添加到_稍後觀看清單", key=f"wl_{i}"):
-                            # 从txt中提取标题
-                            title = entry.get('text', '')
+                            title = entry.get('text', '')[:80]
+                            description = entry.get('description', '')[:200]  # 截取200字
                             if not title:
                                 title = url
                             seq = len(st.session_state.watch_later) + 1
                             st.session_state.watch_later.append({
                                 'index': seq,
                                 'url': url,
-                                'title': title[:80]
+                                'title': title,
+                                'description': description
                             })
                             st.success("已加入稍後觀看清單")
                             st.rerun()
