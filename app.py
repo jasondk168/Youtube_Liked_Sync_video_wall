@@ -1,6 +1,6 @@
 """YouTube Liked Downloader - Streamlit 主程序
 本地模式：同步并下载 + 手动勾选打包 + 导入浏览 + 视频下载
-云端模式：仅导入浏览 + 稍后观看列表 + 下载 xlsx（含中文翻译描述，已过滤噪音）
+云端模式：仅导入浏览 + 稍后观看列表 + 下载 xlsx（五列，第五列翻译第四列）
 """
 import sys, os, json, zipfile, base64, tempfile, shutil, time, re, sqlite3
 from pathlib import Path
@@ -62,7 +62,7 @@ if IS_PORTABLE:
 from core.drive_helper import get_drive_file_list, download_file_from_drive
 from core.packager import pack_clips_into_zip
 
-# ===== 导入ZIP辅助函数（含描述提取，过滤噪音）=====
+# ===== 导入ZIP辅助函数（含描述提取，增加fallback机制）=====
 def _import_zip_from_bytes(zip_bytes):
     with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
         if 'manifest.json' not in zf.namelist():
@@ -86,9 +86,9 @@ def _import_zip_from_bytes(zip_bytes):
             thumb_bytes = None
             if thumbnail_name and (tmp_dir / 'thumbnails' / thumbnail_name).exists():
                 thumb_bytes = (tmp_dir / 'thumbnails' / thumbnail_name).read_bytes()
-            # 从txt解析标题和纯净描述
+            # 从txt解析
             title = item.get('text', '')
-            description = ''
+            description = ''        # 最终使用的描述（先过滤，失败则用原始）
             translated_title = None
             if text_bytes:
                 try:
@@ -118,8 +118,14 @@ def _import_zip_from_bytes(zip_bytes):
                         if noise_pattern.search(stripped):
                             continue
                         clean_lines.append(stripped)
+                    # 优先使用过滤后的，若为空则回退到原始描述
                     if clean_lines:
                         description = '\n'.join(clean_lines)[:200]
+                    else:
+                        # 回退到原始描述（不过滤，但依然截取前200字）
+                        raw_desc = '\n'.join(desc_raw_lines)[:200]
+                        if raw_desc.strip():
+                            description = raw_desc
                 except: pass
             if not translated_title and title:
                 translated_title = _translate_text(title)
@@ -467,6 +473,24 @@ if mode == "📂 匯入並瀏覽":
                         if st.button(f"➕ 添加到_稍後觀看清單", key=f"wl_{i}"):
                             title = entry.get('text', '')[:80]
                             description = entry.get('description', '')
+                            # 如果 description 为空但 text_bytes 存在，尝试实时解析（防止导入时遗漏）
+                            if not description and entry.get('text_bytes'):
+                                try:
+                                    content = entry['text_bytes'].decode('utf-8')
+                                    lines = content.splitlines()
+                                    in_desc = False
+                                    desc_raw = []
+                                    for line in lines:
+                                        if line.startswith('Description:'):
+                                            in_desc = True
+                                            continue
+                                        elif line.startswith('Channel:') or line.startswith('Published:') or line.startswith('URL:'):
+                                            in_desc = False
+                                        elif in_desc:
+                                            desc_raw.append(line)
+                                    if desc_raw:
+                                        description = '\n'.join(desc_raw)[:200]
+                                except: pass
                             description_cn = _translate_text(description) if description else ""
                             if not title:
                                 title = url
